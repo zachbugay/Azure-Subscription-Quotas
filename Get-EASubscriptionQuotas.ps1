@@ -4,14 +4,19 @@
 
 .DESCRIPTION
     This script enumerates all Azure subscriptions accessible to the current user,
-    retrieves quota usage for all resource providers across all regions, and exports
-    the data to a formatted Excel workbook.
+    retrieves quota usage for Compute, Network, and Storage providers across all regions
+    where resources are deployed, and exports the data to a formatted Excel workbook.
+
+    Requires:
+    - Windows PowerShell 5.1
+    - Azure CLI (az) installed and logged in (run 'az login' first)
+    - Internet access (to install the ImportExcel module if not already present)
 
 .PARAMETER OutputPath
     Path for the output Excel file. Defaults to EA-Subscription-Quotas-<date>.xlsx in the current directory.
 
 .PARAMETER SubscriptionFilter
-    Optional. Filter subscriptions by name pattern (supports wildcards).
+    Optional. Filter subscriptions by name pattern (supports wildcards). Default: "*" (all).
 
 .PARAMETER MaxRetries
     Maximum number of retries for throttled API calls. Default: 3.
@@ -36,73 +41,119 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-#region Prerequisites
-Write-Host "Checking prerequisites..." -ForegroundColor Cyan
-
-# Check Azure CLI
-try {
-    $null = az account show 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Azure CLI is not logged in. Run 'az login' first."
-        exit 1
-    }
-}
-catch {
-    Write-Error "Azure CLI (az) is not installed or not in PATH. Install from https://aka.ms/installazurecli"
-    exit 1
-}
-
-# Check/Install ImportExcel module
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Write-Host "ImportExcel module not found. Installing..." -ForegroundColor Yellow
-    Install-Module -Name ImportExcel -Force -Scope CurrentUser -AllowClobber
-}
-Import-Module ImportExcel
-
-Write-Host "Prerequisites OK." -ForegroundColor Green
-#endregion
-
 #region Helper Functions
-function Invoke-AzRestWithRetry {
+
+function Invoke-AzCli {
+    <#
+    .SYNOPSIS
+        Safely invokes an Azure CLI command and returns the output.
+        Handles the PowerShell 5.1 issue where stderr from native commands
+        becomes a terminating error when $ErrorActionPreference is 'Stop'.
+    #>
     param(
-        [string]$Uri,
-        [int]$MaxRetries = 3
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
     )
 
-    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
-        $response = az rest --method GET --url $Uri 2>&1
-        if ($LASTEXITCODE -eq 0) {
+    $callerErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & az @Arguments 2>&1
+        $script:LastAzExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $callerErrorAction
+    }
+
+    return $output
+}
+
+function Invoke-AzRestWithRetry {
+    <#
+    .SYNOPSIS
+        Calls az rest GET with retry logic for throttling (HTTP 429).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+
+        [int]$RetryCount = 3
+    )
+
+    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+        $response = Invoke-AzCli -Arguments @("rest", "--method", "GET", "--url", $Uri, "--only-show-errors")
+
+        if ($script:LastAzExitCode -eq 0) {
             return ($response | ConvertFrom-Json)
         }
 
-        $responseText = $response -join " "
+        $responseText = ($response | Out-String)
         if ($responseText -match "429" -or $responseText -match "throttl") {
             $waitSeconds = [math]::Pow(2, $attempt) * 5
-            Write-Warning "Throttled on attempt $attempt. Waiting $waitSeconds seconds..."
+            Write-Warning "Throttled on attempt $attempt for URI. Waiting $waitSeconds seconds..."
             Start-Sleep -Seconds $waitSeconds
         }
         else {
             return $null
         }
     }
-    Write-Warning "Max retries exceeded for: $Uri"
+
+    Write-Warning "Max retries ($RetryCount) exceeded for: $Uri"
     return $null
 }
+
+#endregion
+
+#region Prerequisites
+Write-Host "Checking prerequisites..." -ForegroundColor Cyan
+
+# Ensure TLS 1.2 for PowerShell Gallery access
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Check Azure CLI is installed
+$azVersionOutput = Invoke-AzCli -Arguments @("--version")
+if ($script:LastAzExitCode -ne 0) {
+    Write-Error "Azure CLI (az) is not installed or not in PATH. Install from https://aka.ms/installazurecli"
+    exit 1
+}
+
+# Check Azure CLI is logged in
+$null = Invoke-AzCli -Arguments @("account", "show", "--only-show-errors")
+if ($script:LastAzExitCode -ne 0) {
+    Write-Error "Azure CLI is not logged in. Run 'az login' first."
+    exit 1
+}
+
+# Check/Install ImportExcel module
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Write-Host "ImportExcel module not found. Installing..." -ForegroundColor Yellow
+
+    # Ensure NuGet provider is available
+    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+    }
+
+    Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+    Install-Module -Name ImportExcel -Force -Scope CurrentUser -AllowClobber
+}
+Import-Module ImportExcel -ErrorAction Stop
+
+Write-Host "Prerequisites OK." -ForegroundColor Green
 #endregion
 
 #region Get Subscriptions
 Write-Host "`nRetrieving subscriptions..." -ForegroundColor Cyan
 
-$subscriptionsJson = az account list --all --output json 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to retrieve subscriptions: $subscriptionsJson"
+$subscriptionsJson = Invoke-AzCli -Arguments @("account", "list", "--all", "--output", "json", "--only-show-errors")
+if ($script:LastAzExitCode -ne 0) {
+    Write-Error "Failed to retrieve subscriptions. Ensure you are logged in with 'az login'."
     exit 1
 }
 
 $allSubscriptions = $subscriptionsJson | ConvertFrom-Json
-$subscriptions = $allSubscriptions | Where-Object {
+$subscriptions = @($allSubscriptions | Where-Object {
     $_.state -eq "Enabled" -and $_.name -like $SubscriptionFilter
-}
+})
 
 if ($subscriptions.Count -eq 0) {
     Write-Error "No enabled subscriptions found matching filter '$SubscriptionFilter'."
@@ -128,11 +179,11 @@ Write-Host "`nDiscovering regions with deployed resources..." -ForegroundColor C
 $regionsPerSubscription = @{}
 
 foreach ($sub in $subscriptions) {
-    az account set --subscription $sub.id 2>&1 | Out-Null
+    $null = Invoke-AzCli -Arguments @("account", "set", "--subscription", $sub.id, "--only-show-errors")
 
-    $resourcesJson = az resource list --query "[].location" --output json 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $deployedRegions = ($resourcesJson | ConvertFrom-Json) | Sort-Object -Unique
+    $resourcesJson = Invoke-AzCli -Arguments @("resource", "list", "--query", "[].location", "--output", "json", "--only-show-errors")
+    if ($script:LastAzExitCode -eq 0) {
+        $deployedRegions = @(($resourcesJson | ConvertFrom-Json) | Sort-Object -Unique)
         $regionsPerSubscription[$sub.id] = $deployedRegions
     }
     else {
@@ -141,14 +192,14 @@ foreach ($sub in $subscriptions) {
     }
 }
 
-$allRegions = ($regionsPerSubscription.Values | ForEach-Object { $_ }) | Sort-Object -Unique
+$allRegions = @(($regionsPerSubscription.Values | ForEach-Object { $_ }) | Sort-Object -Unique)
 Write-Host "Found $($allRegions.Count) region(s) with deployed resources across all subscriptions." -ForegroundColor Green
 #endregion
 
 #region Get Quotas
 Write-Host "`nRetrieving quotas (this may take a while)..." -ForegroundColor Cyan
 
-$quotaResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+$quotaResults = New-Object System.Collections.Generic.List[PSCustomObject]
 $totalIterations = ($regionsPerSubscription.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
 $currentIteration = 0
 
@@ -171,7 +222,7 @@ foreach ($sub in $subscriptions) {
 
         # Compute quotas (Microsoft.Compute)
         $computeUri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Compute/locations/$region/usages?api-version=2023-03-01"
-        $computeData = Invoke-AzRestWithRetry -Uri $computeUri -MaxRetries $MaxRetries
+        $computeData = Invoke-AzRestWithRetry -Uri $computeUri -RetryCount $MaxRetries
 
         if ($computeData -and $computeData.value) {
             foreach ($item in $computeData.value) {
@@ -194,7 +245,7 @@ foreach ($sub in $subscriptions) {
 
         # Network quotas (Microsoft.Network)
         $networkUri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Network/locations/$region/usages?api-version=2023-05-01"
-        $networkData = Invoke-AzRestWithRetry -Uri $networkUri -MaxRetries $MaxRetries
+        $networkData = Invoke-AzRestWithRetry -Uri $networkUri -RetryCount $MaxRetries
 
         if ($networkData -and $networkData.value) {
             foreach ($item in $networkData.value) {
@@ -217,7 +268,7 @@ foreach ($sub in $subscriptions) {
 
         # Storage quotas (Microsoft.Storage)
         $storageUri = "https://management.azure.com/subscriptions/$subId/providers/Microsoft.Storage/locations/$region/usages?api-version=2023-01-01"
-        $storageData = Invoke-AzRestWithRetry -Uri $storageUri -MaxRetries $MaxRetries
+        $storageData = Invoke-AzRestWithRetry -Uri $storageUri -RetryCount $MaxRetries
 
         if ($storageData -and $storageData.value) {
             foreach ($item in $storageData.value) {
